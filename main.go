@@ -122,9 +122,6 @@ func run(cmd *cobra.Command, args []string, params params) (err error) {
 	}
 
 	defer func() {
-		if err != nil {
-			fmt.Println("error:", err)
-		}
 		cleanupMsg()
 	}()
 
