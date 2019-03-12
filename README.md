@@ -139,7 +139,6 @@ kubectl delete validatingwebhookconfigurations $USER-opa-webhook
 
 ## TODO
 
-* Add support for `$KUBECONFIG` environment variable.
 * Add support for specifying OPA image version(s).
 * Add option to disable test namespace instantiation.
 * Add support for specifying inventory dependencies manually.

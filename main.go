@@ -32,12 +32,14 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+
+	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 )
 
 type params struct {
-	kubeconfig string
-	prefix     string
-	format     string
+	configAccess clientcmd.ConfigAccess
+	prefix       string
+	format       string
 }
 
 var defaultKubeconfig = filepath.Join(os.Getenv("HOME"), ".kube", "config")
@@ -63,13 +65,20 @@ func main() {
 			return nil
 		},
 		Run: func(cmd *cobra.Command, args []string) {
-			run(cmd, args, params)
+			if err := run(cmd, args, params); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
 		},
 	}
 
-	cmd.Flags().StringVarP(&params.kubeconfig, "kubeconfig", "", defaultKubeconfig, "set absolute path of kubeconfig file")
+	pathOpts := clientcmd.NewDefaultPathOptions()
+
+	cmd.PersistentFlags().StringVar(&pathOpts.LoadingRules.ExplicitPath, pathOpts.ExplicitFileFlag, pathOpts.LoadingRules.ExplicitPath, "use a particular kubeconfig file")
 	cmd.Flags().StringVarP(&params.prefix, "prefix", "p", os.Getenv("USER"), "set namespace and webhook name prefix")
 	cmd.Flags().StringVarP(&params.format, "format", "f", "pretty", "set output format (pretty or json)")
+
+	params.configAccess = pathOpts
 
 	if err := cmd.Execute(); err != nil {
 		log.Fatal(err)
@@ -77,6 +86,23 @@ func main() {
 }
 
 func run(cmd *cobra.Command, args []string, params params) (err error) {
+
+	startingConfig, err := params.configAccess.GetStartingConfig()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Using context %q\n", startingConfig.CurrentContext)
+
+	config, err := clientcmd.NewDefaultClientConfig(*startingConfig, &clientcmd.ConfigOverrides{}).ClientConfig()
+	if err != nil {
+		return err
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return err
+	}
 
 	var env environment
 
@@ -110,16 +136,6 @@ func run(cmd *cobra.Command, args []string, params params) (err error) {
 		cleanupMsg()
 		os.Exit(1)
 	}()
-
-	config, err := clientcmd.BuildConfigFromFlags("", params.kubeconfig)
-	if err != nil {
-		return fmt.Errorf("%v (try specifying --kubeconfig)", err)
-	}
-
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return err
-	}
 
 	env, err = deployAdmissionController(clientset, opaNsName, testNsName, webhookName, opaClusterRoleBindingName, args)
 	if err != nil {
@@ -622,7 +638,16 @@ func getFiles(args []string) (map[string][]byte, error) {
 	if generateDefaultDecision {
 		files["default-system-main.rego"] = []byte(generateBoilerplate(systemPackage, modules).String())
 	}
+	for filename, bs := range files {
+		delete(files, filename)
+		files[sanitizeFilename(filename)] = bs
+	}
 	return files, nil
+}
+
+func sanitizeFilename(filename string) string {
+	// TODO(tsandall): this ought to handle other non-alphanumeric/-/_/. characters.
+	return strings.Replace(filename, "/", "_", -1)
 }
 
 func containsMainRule(systemPackage *ast.Package, module *ast.Module) bool {
