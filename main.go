@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -40,6 +41,7 @@ type params struct {
 	configAccess clientcmd.ConfigAccess
 	prefix       string
 	format       string
+	mutating     bool
 }
 
 var defaultKubeconfig = filepath.Join(os.Getenv("HOME"), ".kube", "config")
@@ -77,6 +79,7 @@ func main() {
 	cmd.PersistentFlags().StringVar(&pathOpts.LoadingRules.ExplicitPath, pathOpts.ExplicitFileFlag, pathOpts.LoadingRules.ExplicitPath, "use a particular kubeconfig file")
 	cmd.Flags().StringVarP(&params.prefix, "prefix", "p", os.Getenv("USER"), "set namespace and webhook name prefix")
 	cmd.Flags().StringVarP(&params.format, "format", "f", "pretty", "set output format (pretty or json)")
+	cmd.Flags().BoolVarP(&params.mutating, "mutating", "m", false, "register as a mutating webhook instead of a validating webhook")
 
 	params.configAccess = pathOpts
 
@@ -114,7 +117,16 @@ func run(cmd *cobra.Command, args []string, params params) (err error) {
 	cleanupMsg := func() {
 		fmt.Println()
 		fmt.Printf("# Run the following command to disable webhook:\n")
-		fmt.Printf("kubectl delete validatingwebhookconfigurations/%v\n", webhookName)
+
+		var webhookKind string
+
+		if params.mutating {
+			webhookKind = "mutatingwebhookconfigurations"
+		} else {
+			webhookKind = "validatingwebhookconfigurations"
+		}
+
+		fmt.Printf("kubectl delete %v/%v\n", webhookKind, webhookName)
 		fmt.Println()
 		fmt.Printf("# Run the following commands to cleanup:\n")
 		fmt.Printf("kubectl delete namespaces/%v namespaces/%v\n", opaNsName, testNsName)
@@ -134,7 +146,7 @@ func run(cmd *cobra.Command, args []string, params params) (err error) {
 		os.Exit(1)
 	}()
 
-	env, err = deployAdmissionController(clientset, opaNsName, testNsName, webhookName, opaClusterRoleBindingName, args)
+	env, err = deployAdmissionController(clientset, opaNsName, testNsName, webhookName, opaClusterRoleBindingName, params.mutating, args)
 	if err != nil {
 		return err
 	}
@@ -209,6 +221,10 @@ func printPretty(decision *decision) error {
 		fmt.Println("Reason    :", decision.Reason)
 	}
 
+	if len(decision.Patch) > 0 {
+		fmt.Println("Patch     :", decision.Patch)
+	}
+
 	return nil
 }
 
@@ -219,13 +235,14 @@ func printJSON(decision *decision) error {
 }
 
 type environment struct {
-	TestNamespace *v1.Namespace
-	OPANamespace  *v1.Namespace
-	Webhook       *admission.ValidatingWebhookConfiguration
-	Pod           *v1.Pod
+	TestNamespace     *v1.Namespace
+	OPANamespace      *v1.Namespace
+	ValidatingWebhook *admission.ValidatingWebhookConfiguration
+	MutatingWebhook   *admission.MutatingWebhookConfiguration
+	Pod               *v1.Pod
 }
 
-func deployAdmissionController(clientset *kubernetes.Clientset, opaNsName, testNsName, webhookName, opaClusterRoleBindingName string, args []string) (environment, error) {
+func deployAdmissionController(clientset *kubernetes.Clientset, opaNsName, testNsName, webhookName, opaClusterRoleBindingName string, mutating bool, args []string) (environment, error) {
 
 	var env environment
 	var err error
@@ -405,41 +422,57 @@ func deployAdmissionController(clientset *kubernetes.Clientset, opaNsName, testN
 
 	failurePolicy := admission.Fail
 
-	env.Webhook, err = applyValidatingWebhookConfiguration(clientset, &admission.ValidatingWebhookConfiguration{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: webhookName,
+	webhook := admission.Webhook{
+		Name: "admission.openpolicyagent.org",
+		ClientConfig: admission.WebhookClientConfig{
+			Service: &admission.ServiceReference{
+				Namespace: svc.Namespace,
+				Name:      svc.Name,
+			},
+			CABundle: caCert,
 		},
-		Webhooks: []admission.Webhook{
+		Rules: []admission.RuleWithOperations{
 			{
-				Name: "admission.openpolicyagent.org",
-				ClientConfig: admission.WebhookClientConfig{
-					Service: &admission.ServiceReference{
-						Namespace: svc.Namespace,
-						Name:      svc.Name,
-					},
-					CABundle: caCert,
-				},
-				Rules: []admission.RuleWithOperations{
-					{
-						Operations: []admission.OperationType{admission.OperationAll},
-						Rule: admission.Rule{
-							APIGroups:   []string{"*"},
-							APIVersions: []string{"*"},
-							Resources:   []string{"*"},
-						},
-					},
-				},
-				FailurePolicy: &failurePolicy,
-				NamespaceSelector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{
-						"name": env.TestNamespace.Name,
-					},
+				Operations: []admission.OperationType{admission.OperationAll},
+				Rule: admission.Rule{
+					APIGroups:   []string{"*"},
+					APIVersions: []string{"*"},
+					Resources:   []string{"*"},
 				},
 			},
 		},
-	})
-	if err != nil {
-		return env, err
+		FailurePolicy: &failurePolicy,
+		NamespaceSelector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				"name": env.TestNamespace.Name,
+			},
+		},
+	}
+
+	if !mutating {
+		env.ValidatingWebhook, err = applyValidatingWebhookConfiguration(clientset, &admission.ValidatingWebhookConfiguration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: webhookName,
+			},
+			Webhooks: []admission.Webhook{
+				webhook,
+			},
+		})
+		if err != nil {
+			return env, err
+		}
+	} else {
+		env.MutatingWebhook, err = applyMutatingWebhookConfiguration(clientset, &admission.MutatingWebhookConfiguration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: webhookName,
+			},
+			Webhooks: []admission.Webhook{
+				webhook,
+			},
+		})
+		if err != nil {
+			return env, err
+		}
 	}
 
 	if err := waitForRunning(clientset, env.Pod); err != nil {
@@ -466,6 +499,7 @@ type decisionDecoder struct {
 type decision struct {
 	Review   admissionreview.AdmissionReview `json:"review"`
 	Allowed  bool                            `json:"allowed"`
+	Patch    []interface{}                   `json:"patch,omitempty"`
 	Reason   string                          `json:"reason"`
 	Duration time.Duration                   `json:"duration"`
 }
@@ -517,8 +551,10 @@ func (d *decisionDecoder) Decode() (*decision, error) {
 
 	var body struct {
 		Response struct {
-			Allowed bool `json:"allowed"`
-			Status  struct {
+			Allowed   bool    `json:"allowed"`
+			PatchType string  `json:"patchType"`
+			Patch     *string `json:"patch"`
+			Status    struct {
 				Reason string `json:"reason"`
 			} `json:"status"`
 		} `json:"response"`
@@ -531,6 +567,19 @@ func (d *decisionDecoder) Decode() (*decision, error) {
 	decision.Allowed = body.Response.Allowed
 	decision.Reason = body.Response.Status.Reason
 	decision.Duration = time.Duration(resp.RespDuration) * time.Millisecond
+
+	if body.Response.PatchType == "JSONPatch" && body.Response.Patch != nil {
+		bs, err := base64.RawURLEncoding.DecodeString(*body.Response.Patch)
+		if err != nil {
+			return nil, err
+		} else {
+			decoder := json.NewDecoder(bytes.NewBuffer(bs))
+			decoder.UseNumber()
+			if err := decoder.Decode(&decision.Patch); err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	return &decision, nil
 }
@@ -625,8 +674,8 @@ func getFiles(args []string) (map[string][]byte, error) {
 				return nil, err
 			}
 			modules[filename] = module
-			if !generateDefaultDecision {
-				generateDefaultDecision = containsMainRule(systemPackage, module)
+			if generateDefaultDecision {
+				generateDefaultDecision = !containsMainRule(systemPackage, module)
 			}
 		default:
 			return nil, fmt.Errorf("unsupported file extension %q", ext)
@@ -761,6 +810,21 @@ func applyValidatingWebhookConfiguration(clientset *kubernetes.Clientset, obj *a
 			return nil, err
 		}
 		reg, err = clientset.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations().Create(obj)
+	}
+	return reg, err
+}
+
+func applyMutatingWebhookConfiguration(clientset *kubernetes.Clientset, obj *admission.MutatingWebhookConfiguration) (*admission.MutatingWebhookConfiguration, error) {
+	fmt.Printf("Declaring mutatingwebhookconfiguration %q\n", obj.Name)
+	reg, err := clientset.AdmissionregistrationV1beta1().MutatingWebhookConfigurations().Create(obj)
+	if err != nil {
+		if !errors.IsAlreadyExists(err) {
+			return nil, err
+		}
+		if err := clientset.AdmissionregistrationV1beta1().MutatingWebhookConfigurations().Delete(obj.Name, nil); err != nil {
+			return nil, err
+		}
+		reg, err = clientset.AdmissionregistrationV1beta1().MutatingWebhookConfigurations().Create(obj)
 	}
 	return reg, err
 }

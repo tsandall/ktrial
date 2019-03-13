@@ -142,5 +142,5 @@ kubectl delete validatingwebhookconfigurations $USER-opa-webhook
 * Add support for specifying OPA image version(s).
 * Add option to disable test namespace instantiation.
 * Add support for specifying inventory dependencies manually.
-* Add support for mutating policies.
+* Add support for discovering mutating policies.
 * Automatically create context for test namespace and set current-context.
