@@ -6,14 +6,12 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"math/big"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,7 +24,7 @@ import (
 	"github.com/spf13/cobra"
 	admissionreview "k8s.io/api/admission/v1beta1"
 	admission "k8s.io/api/admissionregistration/v1beta1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	rbac "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,7 +43,6 @@ type params struct {
 }
 
 var defaultKubeconfig = filepath.Join(os.Getenv("HOME"), ".kube", "config")
-var outputFormats = [...]string{"pretty", "json"}
 
 func main() {
 
@@ -54,18 +51,6 @@ func main() {
 	cmd := cobra.Command{
 		Use:   fmt.Sprintf("%v <file-1> [<file-2> [...]]", os.Args[0]),
 		Short: "Trial an OPA admission control policy.",
-		PreRunE: func(cmd *cobra.Command, args []string) error {
-			found := false
-			for _, f := range outputFormats {
-				if f == params.format {
-					found = true
-				}
-			}
-			if !found {
-				return fmt.Errorf("--format must be one of: %v", outputFormats)
-			}
-			return nil
-		},
 		Run: func(cmd *cobra.Command, args []string) {
 			if err := run(cmd, args, params); err != nil {
 				fmt.Fprintln(os.Stderr, err)
@@ -78,7 +63,6 @@ func main() {
 
 	cmd.PersistentFlags().StringVar(&pathOpts.LoadingRules.ExplicitPath, pathOpts.ExplicitFileFlag, pathOpts.LoadingRules.ExplicitPath, "use a particular kubeconfig file")
 	cmd.Flags().StringVarP(&params.prefix, "prefix", "p", os.Getenv("USER"), "set namespace and webhook name prefix")
-	cmd.Flags().StringVarP(&params.format, "format", "f", "pretty", "set output format (pretty or json)")
 	cmd.Flags().BoolVarP(&params.mutating, "mutating", "m", false, "register as a mutating webhook instead of a validating webhook")
 
 	params.configAccess = pathOpts
@@ -171,61 +155,12 @@ func run(cmd *cobra.Command, args []string, params params) (err error) {
 			return err
 		}
 
-		fmt.Println("----")
+		fmt.Println(strings.Repeat("-", 80))
 
-		switch params.format {
-		case "pretty":
-			err = printPretty(decision)
-		case "json":
-			err = printJSON(decision)
-		}
-
-		if err != nil {
+		if err := printJSON(decision); err != nil {
 			return err
 		}
 	}
-}
-
-func printPretty(decision *decision) error {
-	fmt.Println("Operation :", decision.Review.Request.Operation)
-	fmt.Println("Kind      :", gvkToString(decision.Review.Request.Kind))
-
-	if decision.Review.Request.Namespace != "" {
-		fmt.Println("Namespace :", decision.Review.Request.Namespace)
-	}
-
-	fmt.Println("Name      :", decision.Review.Request.Name)
-	fmt.Println("Username  :", decision.Review.Request.UserInfo.Username)
-	fmt.Println("Groups    :", decision.Review.Request.UserInfo.Groups)
-
-	bs, err := json.MarshalIndent(decision.Review.Request.Object, "  ", "  ")
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("Object    :")
-	fmt.Println(" ", string(bs))
-	fmt.Println("Duration  :", decision.Duration)
-
-	var answer string
-
-	if decision.Allowed {
-		answer = "ALLOW"
-	} else {
-		answer = "DENY"
-	}
-
-	fmt.Println("Decision  :", answer)
-
-	if !decision.Allowed {
-		fmt.Println("Reason    :", decision.Reason)
-	}
-
-	if len(decision.Patch) > 0 {
-		fmt.Println("Patch     :", decision.Patch)
-	}
-
-	return nil
 }
 
 func printJSON(decision *decision) error {
@@ -333,7 +268,7 @@ func deployAdmissionController(clientset *kubernetes.Clientset, opaNsName, testN
 	containers := []v1.Container{
 		{
 			Name:  "opa",
-			Image: "openpolicyagent/opa:0.10.5",
+			Image: "openpolicyagent/opa:0.13.0",
 			Args: []string{
 				"run",
 				"--log-level=debug",
@@ -344,6 +279,7 @@ func deployAdmissionController(clientset *kubernetes.Clientset, opaNsName, testN
 				"--tls-cert-file=/certs/tls.crt",
 				"--tls-private-key-file=/certs/tls.key",
 				"--ignore=.*",
+				"--set=decision_logs.console=true",
 				"/policies",
 			},
 			VolumeMounts: []v1.VolumeMount{
@@ -497,91 +433,30 @@ type decisionDecoder struct {
 }
 
 type decision struct {
-	Review   admissionreview.AdmissionReview `json:"review"`
-	Allowed  bool                            `json:"allowed"`
-	Patch    []interface{}                   `json:"patch,omitempty"`
-	Reason   string                          `json:"reason"`
-	Duration time.Duration                   `json:"duration"`
+	Input   admissionreview.AdmissionReview `json:"input"`
+	Result  admissionreview.AdmissionReview `json:"result"`
+	Metrics map[string]interface{}          `json:"metrics"`
 }
 
 func (d *decisionDecoder) Decode() (*decision, error) {
 
-	// TODO(tsandall): this code doesn't take into account interleaved
-	// request/response messages that OPA might emit (e.g., req1 req2
-	// resp1 resp2).
-	decision := decision{}
-
-	var req struct {
-		ReqMethod string `json:"req_method"`
-		ReqBody   string `json:"req_body"`
-		ReqPath   string `json:"req_path"`
-		ReqID     int    `json:"req_id"`
-	}
-
 	for {
-		if err := d.Decoder.Decode(&req); err != nil {
+
+		var record struct {
+			decision
+			Msg string `json:"msg"`
+		}
+
+		if err := d.Decoder.Decode(&record); err != nil {
 			return nil, err
 		}
 
-		if req.ReqMethod != http.MethodPost || req.ReqPath != "/" || req.ReqBody == "" {
+		if record.Msg != "Decision Log" {
 			continue
 		}
 
-		if err := json.Unmarshal([]byte(req.ReqBody), &decision.Review); err != nil {
-			return nil, err
-		}
-
-		break
+		return &record.decision, nil
 	}
-
-	var resp struct {
-		RespStatus   int     `json:"resp_status"`
-		RespBody     string  `json:"resp_body"`
-		RespDuration float64 `json:"resp_duration"`
-		ReqID        int     `json:"req_id"`
-	}
-
-	if err := d.Decoder.Decode(&resp); err != nil {
-		return nil, err
-	}
-
-	if resp.ReqID != req.ReqID {
-		return nil, fmt.Errorf("oops: received out-of-order request/response")
-	}
-
-	var body struct {
-		Response struct {
-			Allowed   bool    `json:"allowed"`
-			PatchType string  `json:"patchType"`
-			Patch     *string `json:"patch"`
-			Status    struct {
-				Reason string `json:"reason"`
-			} `json:"status"`
-		} `json:"response"`
-	}
-
-	if err := json.Unmarshal([]byte(resp.RespBody), &body); err != nil {
-		return nil, err
-	}
-
-	decision.Allowed = body.Response.Allowed
-	decision.Reason = body.Response.Status.Reason
-	decision.Duration = time.Duration(resp.RespDuration) * time.Millisecond
-
-	if body.Response.PatchType == "JSONPatch" && body.Response.Patch != nil {
-		bs, err := base64.RawURLEncoding.DecodeString(*body.Response.Patch)
-		if err != nil {
-			return nil, err
-		} else {
-			decoder := json.NewDecoder(bytes.NewBuffer(bs))
-			decoder.UseNumber()
-			if err := decoder.Decode(&decision.Patch); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	return &decision, nil
 }
 
 func getKubemgmtReplicateFlagSets(resourceLists []*metav1.APIResourceList, resources map[string]struct{}) (replicate []string, replicateCluster []string) {

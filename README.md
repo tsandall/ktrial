@@ -81,53 +81,88 @@ Detected cluster-scoped resources   : [v1/namespaces]
 
 ## Output
 
-By default, `ktrial` prints the decisions in a human-readable format:
+`ktrial` prints the `input`, `result`, and `metrics` keys from the OPA decision
+log to the console as JSON:
 
-```
-----
-Operation : CREATE
-Kind      : extensions/v1beta1/Ingress
-Namespace : torin-opa-test
-Name      : 
-Username  : minikube-user
-Groups    : [system:masters system:authenticated]
-Object    :
-  {
-    "metadata": {
-      "name": "ingress-bad",
+```json
+{
+  "input": {
+    "kind": "AdmissionReview",
+    "apiVersion": "admission.k8s.io/v1beta1",
+    "request": {
+      "uid": "fca7da4b-5d5b-4741-8c32-59700a4670f3",
+      "kind": {
+        "group": "",
+        "version": "v1",
+        "kind": "Event"
+      },
+      "resource": {
+        "group": "",
+        "version": "v1",
+        "resource": "events"
+      },
       "namespace": "torin-opa-test",
-      "uid": "82e18de3-4414-11e9-a7c0-08002716a967",
-      "generation": 1,
-      "creationTimestamp": "2019-03-11T15:44:09Z"
-    },
-    "spec": {
-      "rules": [
-        {
-          "host": "acmecorp.com",
-          "http": {
-            "paths": [
-              {
-                "backend": {
-                  "serviceName": "nginx",
-                  "servicePort": 80
-                }
-              }
-            ]
-          }
-        }
-      ]
-    },
-    "status": {
-      "loadBalancer": {}
+      "operation": "CREATE",
+      "userInfo": {
+        "username": "system:node:kind-control-plane",
+        "groups": [
+          "system:nodes",
+          "system:authenticated"
+        ]
+      },
+      "object": {
+        "apiVersion": "v1",
+        "count": 1,
+        "eventTime": null,
+        "firstTimestamp": "2019-08-13T15:06:37Z",
+        "involvedObject": {
+          "apiVersion": "v1",
+          "fieldPath": "spec.containers{nginx}",
+          "kind": "Pod",
+          "name": "nginx-7bb7cd8db5-lk2tm",
+          "namespace": "torin-opa-test",
+          "resourceVersion": "910",
+          "uid": "808cf273-1f6f-4c9b-9259-fdfd803d48b6"
+        },
+        "kind": "Event",
+        "lastTimestamp": "2019-08-13T15:06:37Z",
+        "message": "Started container nginx",
+        "metadata": {
+          "creationTimestamp": "2019-08-13T15:06:37Z",
+          "name": "nginx-7bb7cd8db5-lk2tm.15ba83db166bcfb4",
+          "namespace": "torin-opa-test",
+          "uid": "e157b4d9-636c-4dfb-9689-6ce39e049909"
+        },
+        "reason": "Started",
+        "reportingComponent": "",
+        "reportingInstance": "",
+        "source": {
+          "component": "kubelet",
+          "host": "kind-control-plane"
+        },
+        "type": "Normal"
+      },
+      "oldObject": null
     }
+  },
+  "result": {
+    "kind": "AdmissionReview",
+    "apiVersion": "admission.k8s.io/v1beta1",
+    "response": {
+      "uid": "",
+      "allowed": true
+    }
+  },
+  "metrics": {
+    "timer_rego_module_compile_ns": 221,
+    "timer_rego_module_parse_ns": 521,
+    "timer_rego_query_compile_ns": 119925,
+    "timer_rego_query_eval_ns": 102984,
+    "timer_rego_query_parse_ns": 219307,
+    "timer_server_handler_ns": 650534
   }
-Duration  : 2ms
-Decision  : DENY
-Reason    : invalid ingress host "acmecorp.com"
+}
 ```
-
-If you run `ktrial` with `--format=json` it will print the decisions
-in JSON which is useful for test purposes.
 
 ## Cleaning up
 
